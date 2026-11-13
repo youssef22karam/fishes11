@@ -1,0 +1,626 @@
+import * as THREE from 'three';
+import { BodyModel } from './model';
+import type { CaudalSpec, FinShape, MedianFin, PairedFin, Species } from './types';
+import { clamp, curve, DEG, lerp, rng, smooth } from './math';
+import { ensureAttrs, makeUniforms, patchMaterial, type FishUniforms } from './shader';
+import { paintBump, paintSkin } from './skin';
+
+// ── geometry helpers ─────────────────────────────────────────────────────────
+interface V {
+  p: THREE.Vector3;
+  jaw?: number;
+  flap?: number;
+  side?: number;
+  plastic?: [number, number, number, number];
+}
+
+function grid(nu: number, nv: number, fn: (u: number, v: number) => V, flipWinding = false) {
+  const pos: number[] = [], uv: number[] = [], jaw: number[] = [], flap: number[] = [], side: number[] = [], pl: number[] = [], idx: number[] = [];
+  for (let j = 0; j <= nv; j++)
+    for (let i = 0; i <= nu; i++) {
+      const u = i / nu, v = j / nv;
+      const r = fn(u, v);
+      pos.push(r.p.x, r.p.y, r.p.z);
+      uv.push(u, v);
+      jaw.push(r.jaw ?? 0);
+      flap.push(r.flap ?? 0);
+      side.push(r.side ?? 0);
+      const rp = r.plastic;
+      if (rp) pl.push(rp[0], rp[1], rp[2], rp[3]);
+      else pl.push(0, 0, 0, 0);
+    }
+  for (let j = 0; j < nv; j++)
+    for (let i = 0; i < nu; i++) {
+      const a = j * (nu + 1) + i, b = a + 1, c = a + nu + 1, d = c + 1;
+      if (flipWinding) idx.push(a, c, b, b, c, d);
+      else idx.push(a, b, c, b, d, c);
+    }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
+  g.setAttribute('aJaw', new THREE.Float32BufferAttribute(jaw, 1));
+  g.setAttribute('aFlap', new THREE.Float32BufferAttribute(flap, 1));
+  g.setAttribute('aSide', new THREE.Float32BufferAttribute(side, 1));
+  g.setAttribute('aPlastic', new THREE.Float32BufferAttribute(pl, 4));
+  g.setIndex(idx);
+  g.computeVertexNormals();
+  return g;
+}
+
+/** Exact mirror reflection across z = 0 – guarantees 100% bilateral symmetry */
+function mirrorZ(src: THREE.BufferGeometry, sideVal = -1) {
+  const g = src.clone();
+  const P = g.getAttribute('position') as THREE.BufferAttribute;
+  const N = g.getAttribute('normal') as THREE.BufferAttribute | undefined;
+  const S = g.getAttribute('aSide') as THREE.BufferAttribute | undefined;
+  for (let i = 0; i < P.count; i++) {
+    P.setZ(i, -P.getZ(i));
+    if (N) N.setZ(i, -N.getZ(i));
+    if (S) S.setX(i, sideVal);
+  }
+  const idx = g.getIndex();
+  if (idx) {
+    const arr = idx.array as Uint16Array | Uint32Array;
+    for (let i = 0; i < arr.length; i += 3) {
+      const t = arr[i + 1];
+      arr[i + 1] = arr[i + 2];
+      arr[i + 2] = t;
+    }
+    idx.needsUpdate = true;
+  }
+  P.needsUpdate = true;
+  if (N) N.needsUpdate = true;
+  if (S) S.needsUpdate = true;
+  return g;
+}
+
+/** Build a closed 2-sided 3D hydrofoil / fleshy fin from mid-surface + normal + half-thickness */
+function foilGrid(
+  nu: number,
+  nv: number,
+  fn: (u: number, v: number) => { p: THREE.Vector3; n: THREE.Vector3; t: number; flap: number; side: number },
+) {
+  const pos: number[] = [], uv: number[] = [], jaw: number[] = [], flap: number[] = [], side: number[] = [], pl: number[] = [], idx: number[] = [];
+  const stride = nu + 1;
+  const layerCount = (nu + 1) * (nv + 1);
+  for (const sgn of [1, -1] as const) {
+    for (let j = 0; j <= nv; j++)
+      for (let i = 0; i <= nu; i++) {
+        const u = i / nu, v = j / nv;
+        const r = fn(u, v);
+        // taper thickness cleanly to 0 at tip (v=1) and trailing edge (u=1), rounded at leading edge (u=0)
+        const chord = Math.sqrt(clamp(u + 0.015)) * Math.pow(clamp(1 - u * 0.92), 0.9);
+        const span = Math.pow(clamp(1 - v), 0.72) * (1 + 0.65 * Math.exp(-v * 8));
+        const th = r.t * chord * span * (u < 0.001 || u > 0.999 || v > 0.999 ? 0 : 1);
+        const q = r.p.clone().addScaledVector(r.n, sgn * th);
+        pos.push(q.x, q.y, q.z);
+        uv.push(u, v);
+        jaw.push(0);
+        flap.push(r.flap);
+        side.push(r.side);
+        pl.push(0, 0, 0, 0);
+      }
+  }
+  // orient faces outward using first interior sample
+  const s0 = fn(0.35, 0.35);
+  const sU = fn(0.4, 0.35), sV = fn(0.35, 0.4);
+  const cr = new THREE.Vector3().crossVectors(sU.p.clone().sub(s0.p), sV.p.clone().sub(s0.p));
+  const flip = cr.dot(s0.n) < 0;
+  for (let layer = 0; layer < 2; layer++) {
+    const off = layer * layerCount;
+    const fl = layer === 0 ? flip : !flip;
+    for (let j = 0; j < nv; j++)
+      for (let i = 0; i < nu; i++) {
+        const a = off + j * stride + i, b = a + 1, c = a + stride, d = c + 1;
+        if (fl) idx.push(a, c, b, b, c, d);
+        else idx.push(a, b, c, b, d, c);
+      }
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
+  g.setAttribute('aJaw', new THREE.Float32BufferAttribute(jaw, 1));
+  g.setAttribute('aFlap', new THREE.Float32BufferAttribute(flap, 1));
+  g.setAttribute('aSide', new THREE.Float32BufferAttribute(side, 1));
+  g.setAttribute('aPlastic', new THREE.Float32BufferAttribute(pl, 4));
+  g.setIndex(idx);
+  g.computeVertexNormals();
+  return g;
+}
+
+/** accumulates many small baked primitives into one geometry */
+class Batch {
+  pos: number[] = []; nor: number[] = []; uv: number[] = []; jaw: number[] = []; flap: number[] = []; side: number[] = []; pl: number[] = []; idx: number[] = [];
+  add(
+    src: THREE.BufferGeometry,
+    m: THREE.Matrix4,
+    jaw = 0,
+    flapFn?: (p: THREE.Vector3, i: number) => number,
+    side = 0,
+    plastic: [number, number, number, number] = [0, 0, 0, 0],
+  ) {
+    const P = src.getAttribute('position'), N = src.getAttribute('normal'), U = src.getAttribute('uv');
+    const nm = new THREE.Matrix3().getNormalMatrix(m);
+    const base = this.pos.length / 3;
+    const v = new THREE.Vector3(), n = new THREE.Vector3();
+    for (let i = 0; i < P.count; i++) {
+      v.fromBufferAttribute(P, i);
+      const local = v.clone();
+      v.applyMatrix4(m);
+      n.fromBufferAttribute(N, i).applyMatrix3(nm).normalize();
+      this.pos.push(v.x, v.y, v.z); this.nor.push(n.x, n.y, n.z);
+      this.uv.push(U ? U.getX(i) : 0, U ? U.getY(i) : 0);
+      this.jaw.push(jaw); this.flap.push(flapFn ? flapFn(local, i) : 0); this.side.push(side);
+      this.pl.push(plastic[0], plastic[1], plastic[2], plastic[3]);
+    }
+    if (src.index) for (let i = 0; i < src.index.count; i++) this.idx.push(base + src.index.getX(i));
+    else for (let i = 0; i < P.count; i++) this.idx.push(base + i);
+  }
+  build() {
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.Float32BufferAttribute(this.pos, 3));
+    g.setAttribute('normal', new THREE.Float32BufferAttribute(this.nor, 3));
+    g.setAttribute('uv', new THREE.Float32BufferAttribute(this.uv, 2));
+    g.setAttribute('aJaw', new THREE.Float32BufferAttribute(this.jaw, 1));
+    g.setAttribute('aFlap', new THREE.Float32BufferAttribute(this.flap, 1));
+    g.setAttribute('aSide', new THREE.Float32BufferAttribute(this.side, 1));
+    g.setAttribute('aPlastic', new THREE.Float32BufferAttribute(this.pl, 4));
+    g.setIndex(this.idx);
+    return g;
+  }
+  get empty() { return this.pos.length === 0; }
+}
+
+const orient = (pos: THREE.Vector3, dir: THREE.Vector3, sx = 1, sy = 1, sz = 1) => {
+  const q = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir.clone().normalize());
+  return new THREE.Matrix4().compose(pos, q, new THREE.Vector3(sx, sy, sz));
+};
+
+// ── refined ichthyological fin outlines (normalised height along base) ──────
+const SHAPES: Record<FinShape, [number, number][]> = {
+  tri: [[0, 0.24], [0.16, 1], [0.52, 0.62], [0.86, 0.26], [1, 0.14]],
+  falcate: [[0, 0.22], [0.11, 1], [0.28, 0.72], [0.56, 0.28], [0.86, 0.13], [1, 0.1]],
+  round: [[0, 0.22], [0.22, 0.84], [0.56, 1], [0.85, 0.8], [1, 0.28]],
+  even: [[0, 0.26], [0.07, 0.9], [0.5, 1], [0.93, 0.9], [1, 0.34]],
+  spiny: [[0, 0.34], [0.15, 0.94], [0.38, 1], [0.7, 0.76], [0.92, 0.48], [1, 0.28]],
+  sail: [[0, 0.35], [0.12, 1], [0.44, 0.96], [0.78, 0.56], [1, 0.14]],
+  adipose: [[0, 0.08], [0.34, 0.78], [0.68, 1], [0.9, 0.78], [1, 0.2]],
+  shark: [[0, 0.08], [0.14, 0.64], [0.28, 1], [0.5, 0.66], [0.74, 0.26], [0.88, 0.12], [1, 0.16]],
+  lobe: [[0, 0.26], [0.26, 0.88], [0.56, 1], [0.82, 0.82], [1, 0.25]],
+  flag: [[0, 0.3], [0.09, 1], [0.22, 0.76], [0.5, 0.36], [1, 0.2]],
+  veil: [[0, 0.38], [0.28, 0.94], [0.68, 1.06], [0.92, 1.02], [1, 0.85]],
+  fan: [[0, 0.42], [0.28, 0.95], [0.64, 1], [0.9, 0.82], [1, 0.55]],
+  rect: [[0, 0.55], [0.12, 0.92], [0.5, 1], [0.9, 0.92], [1, 0.6]],
+  low: [[0, 0.2], [0.1, 0.96], [0.9, 0.98], [1, 0.3]],
+  leaf: [[0, 0.14], [0.35, 0.88], [0.6, 1], [0.88, 0.65], [1, 0.14]],
+};
+const shapeFns: Partial<Record<FinShape, (u: number) => number>> = {};
+const shapeH = (s: FinShape, u: number) => (shapeFns[s] ??= curve(SHAPES[s] ?? SHAPES.tri))(u);
+
+const SWIM: Record<string, { amp: number; wave: number; freq: number; a0: number; pow: number; flap: number; finWave: number }> = {
+  carangiform: { amp: 0.05, wave: 7, freq: 7, a0: 0.1, pow: 2.2, flap: 0.012, finWave: 0.003 },
+  subcarangiform: { amp: 0.06, wave: 6.5, freq: 6, a0: 0.14, pow: 1.8, flap: 0.012, finWave: 0.003 },
+  thunniform: { amp: 0.045, wave: 5.5, freq: 9, a0: 0.04, pow: 3.6, flap: 0.004, finWave: 0.0 },
+  anguilliform: { amp: 0.065, wave: 12, freq: 6, a0: 0.3, pow: 1.1, flap: 0.01, finWave: 0.004 },
+  ostraciiform: { amp: 0.06, wave: 2.5, freq: 8, a0: 0, pow: 7, flap: 0.03, finWave: 0.006 },
+  labriform: { amp: 0.018, wave: 5, freq: 4, a0: 0.1, pow: 2, flap: 0.035, finWave: 0.004 },
+  rajiform: { amp: 0.01, wave: 6, freq: 3, a0: 0, pow: 3, flap: 0.004, finWave: 0 },
+  syngnathiform: { amp: 0.0, wave: 4, freq: 2, a0: 0, pow: 2, flap: 0.02, finWave: 0.015 },
+  still: { amp: 0.012, wave: 5, freq: 3, a0: 0.1, pow: 2, flap: 0.01, finWave: 0.002 },
+};
+
+export interface FishBuild {
+  group: THREE.Group;
+  model: BodyModel;
+  uniforms: FishUniforms;
+  swim: (typeof SWIM)[string];
+  wing: number;
+  radius: number;
+  dispose: () => void;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+export function buildFish(sp: Species, seed = 1): FishBuild {
+  const L = 2;
+  const model = new BodyModel(sp, L);
+  const u = makeUniforms();
+  const group = new THREE.Group();
+  const disposables: { dispose: () => void }[] = [];
+  const R = rng(seed);
+  const col = (c: string) => new THREE.Color(c);
+
+  const addMesh = (g: THREE.BufferGeometry, m: THREE.Material, order = 0, shareMat = false) => {
+    ensureAttrs(g);
+    const mesh = new THREE.Mesh(g, m);
+    mesh.renderOrder = order;
+    mesh.frustumCulled = false;
+    mesh.castShadow = true;
+    group.add(mesh);
+    disposables.push(g);
+    if (!shareMat) disposables.push(m);
+    return mesh;
+  };
+
+  const { mouthTip: mt, rictus: rc, sSym } = model;
+  const symLead = Math.max(0, mt.s - sSym);
+  const m = sp.mouth;
+
+  // shared jaw-weight helper along the seam so upper & lower seam meet watertight behind rictus
+  const seamJawUpper = (s: number, phi: number) => {
+    if (!model.hasJaw()) return 0;
+    const pFold = phi <= Math.PI ? phi : 2 * Math.PI - phi;
+    const pm = model.seamPhi(s);
+    const nearSeam = Math.exp(-Math.pow((pm - pFold) / 0.24, 2));
+    // smoothly match lower-jaw weight right at/behind the rictus so cheek skin stretches without a slit
+    const join = smooth(rc.s - 0.01, rc.s + 0.003, s);
+    const wPost = model.jawWeight(s, 0) * join;
+    const wCheek = model.upperCornerJaw(s, phi) * (1 - join);
+    return (wPost + wCheek) * nearSeam;
+  };
+
+  // ── BODY LOFT ──────────────────────────────────────────────────────────────
+  const NS = 232, nU = 28, nL = 24;
+  const ring = 2 * (nU + nL) + 4;
+  const pos = new Float32Array((NS + 1) * ring * 3);
+  const uvs = new Float32Array((NS + 1) * ring * 2);
+  const jaw = new Float32Array((NS + 1) * ring);
+  const plastic = new Float32Array((NS + 1) * ring * 4);
+  const sAt: number[] = [];
+  const v3 = new THREE.Vector3();
+  for (let i = 0; i <= NS; i++) {
+    const t = i / NS;
+    const s = Math.pow(t, 1.32);
+    sAt.push(s);
+    const pm = model.seamPhi(s);
+    const seg: [number, number, number, number][] = [
+      [0, pm, nU, 0],
+      [pm, Math.PI, nL, 1],
+      [Math.PI, 2 * Math.PI - pm, nL, -1],
+      [2 * Math.PI - pm, 2 * Math.PI, nU, 0],
+    ];
+    let k = i * ring;
+    for (const [a, b, n, lj] of seg) {
+      for (let j = 0; j <= n; j++) {
+        const phi = lerp(a, b, j / n);
+        model.surface(s, phi, v3);
+        if (lj !== 0 && m.jut > 0 && model.hasJaw()) {
+          const depth = lj === 1 ? j / n : 1 - j / n;
+          const k2 = (1 - smooth(mt.s, mt.s + 0.075, s)) * smooth(sSym - 0.01, sSym + 0.004, s) * (1 - 0.45 * depth);
+          v3.x += m.jut * L * k2;
+        }
+        pos.set([v3.x, v3.y, v3.z], k * 3);
+        uvs.set([s, phi / (2 * Math.PI)], k * 2);
+        if (lj !== 0) {
+          const depth = lj === 1 ? j / n : 1 - j / n;
+          jaw[k] = model.jawWeight(s, depth);
+          plastic.set(model.plasticAt(s, phi, true), k * 4);
+        } else {
+          jaw[k] = seamJawUpper(s, phi);
+          plastic.set(model.plasticAt(s, phi, false), k * 4);
+        }
+        k++;
+      }
+    }
+  }
+  const idx: number[] = [];
+  const segStart = [0, nU + 1, nU + nL + 2, nU + 2 * nL + 3];
+  const segN = [nU, nL, nL, nU];
+  for (let i = 0; i < NS; i++)
+    for (let q = 0; q < 4; q++)
+      for (let j = 0; j < segN[q]; j++) {
+        const a = i * ring + segStart[q] + j, b = a + 1, c = a + ring, d = c + 1;
+        idx.push(a, c, b, b, c, d);
+      }
+  const bodyG = new THREE.BufferGeometry();
+  bodyG.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  bodyG.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
+  bodyG.setAttribute('aJaw', new THREE.BufferAttribute(jaw, 1));
+  bodyG.setAttribute('aPlastic', new THREE.BufferAttribute(plastic, 4));
+  bodyG.setIndex(idx);
+  bodyG.computeVertexNormals();
+  {
+    const N = bodyG.getAttribute('normal') as THREE.BufferAttribute;
+    const avg = (a: number, b: number) => {
+      const x = N.getX(a) + N.getX(b), y = N.getY(a) + N.getY(b), z = N.getZ(a) + N.getZ(b);
+      const l = Math.hypot(x, y, z) || 1;
+      N.setXYZ(a, x / l, y / l, z / l); N.setXYZ(b, x / l, y / l, z / l);
+    };
+    for (let i = 0; i <= NS; i++) {
+      const o = i * ring;
+      const lipOpen = model.hasJaw() && sAt[i] >= sSym - 0.004 && sAt[i] <= rc.s + 0.004;
+      if (!lipOpen) { avg(o + nU, o + nU + 1); avg(o + nU + 2 * nL + 2, o + nU + 2 * nL + 3); }
+      avg(o + nU + nL + 1, o + nU + nL + 2);
+      avg(o + ring - 1, o);
+    }
+    N.needsUpdate = true;
+  }
+
+  const skin = paintSkin(model, seed);
+  const bump = paintBump(model, seed);
+  const c = sp.color;
+  const bodyMat = new THREE.MeshPhysicalMaterial({
+    map: skin.tex,
+    bumpMap: bump,
+    bumpScale: sp.skin.bump,
+    roughness: c.rough ?? 0.4,
+    metalness: c.metal ?? 0.08,
+    clearcoat: 0.58,
+    clearcoatRoughness: 0.3,
+    iridescence: c.iri ?? 0,
+    iridescenceIOR: 1.6,
+    sheen: c.sheen ?? 0,
+    sheenColor: new THREE.Color(c.side),
+    transparent: !!c.trans,
+    opacity: c.trans ? 1 - c.trans : 1,
+  });
+  patchMaterial(bodyMat, u);
+  addMesh(bodyG, bodyMat, 1);
+  disposables.push(skin.tex, bump);
+
+  // ── FLESHY LIPS, STRETCHY LABIAL WEBS, ORAL CAVITY, TONGUE & TEETH ─────────
+  if (model.hasJaw()) {
+    const interiorMat = patchMaterial(
+      new THREE.MeshPhysicalMaterial({ color: '#84343d', roughness: 0.36, clearcoat: 0.72, clearcoatRoughness: 0.22, side: THREE.DoubleSide }),
+      u,
+    );
+    disposables.push(interiorMat);
+
+    // Lip colour: natural dermal-mucosal blend (or yellow lips on clown triggerfish)
+    const lipCol = sp.id === 'clown-triggerfish'
+      ? new THREE.Color('#e6b422')
+      : sp.skin.kind === 'placoid'
+        ? new THREE.Color(c.belly).lerp(new THREE.Color(c.side), 0.35)
+        : new THREE.Color(c.side).lerp(new THREE.Color('#ba6c6e'), 0.24 + 0.16 * m.lip);
+    const lipMat = patchMaterial(
+      new THREE.MeshPhysicalMaterial({ color: lipCol, roughness: 0.28, clearcoat: 0.82, clearcoatRoughness: 0.2 }),
+      u,
+    );
+    disposables.push(lipMat);
+
+    // Stretchy maxillary-labial fold material (blends outer lip/cheek skin with mucosal warmth)
+    const webCol = lipCol.clone().lerp(new THREE.Color('#9c4a52'), 0.35);
+    const webMat = patchMaterial(
+      new THREE.MeshPhysicalMaterial({ color: webCol, roughness: 0.32, clearcoat: 0.7, side: THREE.DoubleSide }),
+      u,
+    );
+    disposables.push(webMat);
+
+    // Continuous 3D oral rim curve u ∈ [0, 1]: u=0 at anterior midline (z=0), u=1 at rictus
+    const rimStation = (uVal: number) => {
+      const uu = clamp(uVal);
+      if (symLead > 1e-4) {
+        // smooth horseshoe wrap from (sSym, phi=π, z=0) around mt.s to rc.s
+        const split = 0.24;
+        if (uu <= split) {
+          const k = uu / split;
+          const s = lerp(sSym, mt.s, k * k);
+          const pTarget = model.seamPhi(mt.s);
+          const phi = lerp(Math.PI, pTarget, Math.sin((k * Math.PI) / 2));
+          return { s, phi };
+        }
+        const k = (uu - split) / (1 - split);
+        const s = lerp(mt.s, rc.s, k);
+        return { s, phi: model.seamPhi(s) };
+      }
+      const s = lerp(mt.s, rc.s, Math.pow(uu, 1.05));
+      const phi = uu < 0.06 ? lerp(Math.PI * 0.98, model.seamPhi(mt.s + 1e-3), uu / 0.06) : model.seamPhi(s);
+      return { s, phi };
+    };
+
+    const rimPoint = (uVal: number, side: 1 | -1, isLower: boolean) => {
+      const { s, phi } = rimStation(uVal);
+      const ph = side === 1 ? phi : 2 * Math.PI - phi;
+      const p = model.surface(s, ph);
+      if (uVal <= 1e-4) p.z = 0;
+      if (isLower && m.jut > 0) {
+        const k2 = (1 - smooth(mt.s, mt.s + 0.075, s)) * smooth(sSym - 0.01, sSym + 0.004, s);
+        p.x += m.jut * L * k2;
+      }
+      const jw = isLower ? model.jawWeight(s, 0) : seamJawUpper(s, ph);
+      const pl = model.plasticAt(s, ph, isLower);
+      return { p, s, phi: ph, jw, pl };
+    };
+
+    // 1. 3D Fleshy Upper & Lower Lip Cushions (wrapping continuously left rictus -> symphysis -> right rictus)
+    const lipBaseR = (0.003 + 0.0092 * m.lip) * clamp(0.68 + m.gape * 3.2, 0.68, 1.5) * L;
+    for (const isLower of [false, true]) {
+      const nArc = 46, nSec = 10;
+      const lipG = grid(nArc, nSec, (uu, vv) => {
+        const signed = uu * 2 - 1;
+        const side: 1 | -1 = signed >= 0 ? 1 : -1;
+        const uRim = Math.abs(signed);
+        const A = rimPoint(uRim, side, isLower);
+        const B = rimPoint(Math.min(1, uRim + 0.025), side, isLower);
+        const tang = B.p.clone().sub(A.p);
+        if (tang.lengthSq() < 1e-8) tang.set(0, 0, side);
+        tang.normalize();
+        const ctr = model.local(A.s, 0, 0);
+        const outN = A.p.clone().sub(ctr);
+        outN.z = A.p.z;
+        if (outN.lengthSq() < 1e-8) outN.set(1, isLower ? -0.5 : 0.5, 0);
+        outN.normalize();
+        const fr = model.frame(A.s);
+        const cleftN = fr.N.clone().multiplyScalar(isLower ? 0.85 : -0.85).addScaledVector(outN, 0.45).normalize();
+        const outOrtho = outN.clone().addScaledVector(tang, -outN.dot(tang)).normalize();
+        const rLip = lipBaseR * (0.58 + 0.52 * Math.cos(uRim * Math.PI * 0.44)) * (isLower ? 0.92 : 1.04);
+        const ang = vv * Math.PI * 2;
+        const q = A.p.clone()
+          .addScaledVector(outOrtho, (Math.cos(ang) * 0.88 + 0.16) * rLip)
+          .addScaledVector(cleftN, (Math.sin(ang) * 0.78 - 0.15) * rLip);
+        if (Math.abs(signed) < 1e-3) q.z = 0;
+        const cornerBlend = smooth(0.84, 1.0, uRim);
+        const midJw = model.jawWeight(rc.s, 0) * 0.55;
+        const jw = lerp(A.jw, midJw, cornerBlend);
+        return { p: q, jaw: jw, plastic: A.pl };
+      });
+      addMesh(lipG, lipMat, 2, true);
+    }
+
+    // 2. Stretchy Maxillary-Mandibular Labial Corner Membranes (plicae labiales)
+    const webStart = clamp(0.56 - (m.protrude ?? 0.35) * 0.24, 0.34, 0.55);
+    for (const side of [1, -1] as const) {
+      const webR = grid(16, 10, (uu, vv) => {
+        const uRim = lerp(webStart, 1.0, uu);
+        const U = rimPoint(uRim, side, false);
+        const Lw = rimPoint(uRim, side, true);
+        const p = U.p.clone().lerp(Lw.p, vv);
+        const midFold = Math.sin(Math.PI * vv);
+        // concave crescentic anterior margin + slight inward tuck so closed web hides cleanly inside lips
+        const fr = model.frame(lerp(U.s, Lw.s, vv));
+        const freeBow = (1 - uu) * midFold * Math.min(0.022, m.gape * 0.22) * L;
+        p.addScaledVector(fr.T, freeBow);
+        p.z *= 1 - 0.045 * (1 - uu * 0.5) * (0.35 + 0.65 * midFold);
+        const jw = lerp(U.jw, Lw.jw, vv);
+        const stretch = midFold * Math.sin(Math.PI * clamp(uu * 0.85 + 0.15));
+        const pl: [number, number, number, number] = [
+          lerp(U.pl[0], Lw.pl[0], vv),
+          lerp(U.pl[1], Lw.pl[1], vv),
+          lerp(U.pl[2], Lw.pl[2], vv),
+          stretch,
+        ];
+        return { p, jaw: jw, plastic: pl };
+      }, side === -1);
+      addMesh(webR, webMat, 2, true);
+    }
+
+    // 3. Vaulted Palate, Hyoid Floor, Sculpted Fleshy Tongue & Pharyngeal Throat
+    const s0 = sSym, s1 = rc.s + 0.022;
+    const lipAtS = (s: number, side: 1 | -1) => {
+      const pm = model.seamPhi(s);
+      return model.surface(s, side === 1 ? pm : 2 * Math.PI - pm);
+    };
+    const mid = (s: number) => ({ y: model.mouthY(Math.min(s, rc.s)), top: model.top(s), bot: model.bot(s) });
+
+    // palate (kept strictly inside dorsal snout contour even during premaxillary protrusion)
+    addMesh(grid(12, 24, (uu, vv) => {
+      const s = lerp(s0, s1, vv);
+      const a = lipAtS(s, 1), b = lipAtS(s, -1);
+      const { y, top } = mid(s);
+      const dep = 0.34 * Math.max(0.003, top - y) * smooth(s0, lerp(s0, s1, 0.45), s);
+      const p = a.clone().lerp(b, uu);
+      p.z *= 0.86;
+      const arch = Math.sin(Math.PI * uu) * (1 - 0.16 * Math.pow(Math.sin(Math.PI * 2 * uu), 2));
+      p.addScaledVector(model.frame(s).N, dep * arch * L);
+      const pl = model.plasticAt(s, model.seamPhi(s) * 0.8, false);
+      return { p, jaw: seamJawUpper(s, model.seamPhi(s)) * (1 - 0.6 * Math.sin(Math.PI * uu)), plastic: [pl[0] * 0.55, pl[1] * 0.75, 0, 0] };
+    }), interiorMat, 1, true);
+
+    // oral floor
+    addMesh(grid(12, 24, (uu, vv) => {
+      const s = lerp(s0, s1, vv);
+      const a = lipAtS(s, 1), b = lipAtS(s, -1);
+      const { y, bot } = mid(s);
+      const dep = 0.48 * Math.max(0.004, y + bot) * smooth(s0, s0 + 0.028, s);
+      const p = a.clone().lerp(b, uu);
+      p.z *= 0.91;
+      if (m.jut > 0) {
+        const k2 = (1 - smooth(mt.s, mt.s + 0.075, s)) * (1 - 0.35 * Math.sin(Math.PI * uu));
+        p.x += m.jut * L * k2 * 0.85;
+      }
+      p.addScaledVector(model.frame(s).N, -dep * Math.sin(Math.PI * uu) * L);
+      const w = lerp(model.jawWeight(s, 0), model.jawWeight(s, 0.55), Math.sin(Math.PI * uu));
+      const pl = model.plasticAt(s, Math.PI * 0.92, true);
+      return { p, jaw: w, plastic: [0, pl[1] * 0.8, pl[2] * 0.85 * Math.sin(Math.PI * uu), 0] };
+    }), interiorMat, 1, true);
+
+    // sculpted 3D fleshy tongue (basihyal) on the floor of the mouth
+    const ts0 = lerp(s0, rc.s, 0.22), ts1 = rc.s + 0.012;
+    if (ts1 - ts0 > 0.012) {
+      const tongueMat = patchMaterial(
+        new THREE.MeshPhysicalMaterial({ color: '#a84c56', roughness: 0.28, clearcoat: 0.85 }),
+        u,
+      );
+      addMesh(grid(12, 16, (uu, vv) => {
+        const s = lerp(ts0, ts1, vv);
+        const hwT = Math.abs(lipAtS(s, 1).z) * 0.46 * Math.pow(Math.sin(Math.PI * clamp(vv * 0.88 + 0.08)), 0.55);
+        const { y, bot } = mid(s);
+        const baseY = y - 0.34 * Math.max(0.004, y + bot);
+        const dome = Math.max(0.003, (y + bot) * 0.26) * Math.sin(Math.PI * uu) * Math.sin(Math.PI * clamp(vv * 0.92 + 0.05));
+        const ang = (uu - 0.5) * Math.PI;
+        const p = model.local(s, baseY + dome, Math.sin(ang) * hwT / L);
+        const w = model.jawWeight(s, 0.35);
+        const pl = model.plasticAt(s, Math.PI * 0.95, true);
+        return { p, jaw: w, plastic: [0, 0, pl[2] * 0.8, 0] };
+      }), tongueMat, 2);
+    }
+
+    // pharyngeal throat wall
+    addMesh(grid(12, 6, (uu, vv) => {
+      const s = s1;
+      const a = lipAtS(s, 1), b = lipAtS(s, -1);
+      const { y, top, bot } = mid(s);
+      const p = a.clone().lerp(b, uu);
+      p.z *= 0.91;
+      const up = 0.52 * Math.max(0.004, top - y) * Math.sin(Math.PI * uu);
+      const dn = -0.48 * Math.max(0.004, y + bot) * Math.sin(Math.PI * uu);
+      p.addScaledVector(model.frame(s).N, lerp(up, dn, vv) * L);
+      const w = lerp(model.jawWeight(s, 0), model.jawWeight(s, 0.55), Math.sin(Math.PI * uu)) * vv;
+      const pl = model.plasticAt(s, Math.PI * 0.9, true);
+      return { p, jaw: w, plastic: [0, pl[1] * 0.8, pl[2] * 0.85 * vv, 0] };
+    }), interiorMat, 1, true);
+
+    // 4. Dentition (continuous across anterior symphysis; fused beak plates or multi-row shark/fang teeth)
+    if (m.teeth === 'beak') {
+      // Smooth fused ivory parrotfish / puffer / sunfish / cowfish dental plates
+      const beakMat = patchMaterial(
+        new THREE.MeshPhysicalMaterial({ color: '#ece3ce', roughness: 0.22, clearcoat: 0.7 }),
+        u,
+      );
+      for (const isLower of [false, true]) {
+        const bH = Math.max(0.004, m.ts || 0.006) * L * 1.35;
+        const beakG = grid(24, 6, (uu, vv) => {
+          const signed = (uu * 2 - 1) * 0.78;
+          const side: 1 | -1 = signed >= 0 ? 1 : -1;
+          const R0 = rimPoint(Math.abs(signed), side, isLower);
+          const fr = model.frame(R0.s);
+          const ctr = model.local(R0.s, model.mouthY(Math.min(R0.s, rc.s)), 0);
+          const p = R0.p.clone().lerp(ctr, 0.08 + 0.06 * vv);
+          const taper = Math.cos(signed * Math.PI * 0.52);
+          p.addScaledVector(fr.N, (isLower ? 1 : -1) * vv * bH * taper);
+          if (Math.abs(signed) < 1e-3) p.z = 0;
+          return { p, jaw: R0.jw, plastic: R0.pl };
+        }, isLower);
+        addMesh(beakG, beakMat, 2, isLower);
+      }
+    } else if (m.teeth !== 'none' && m.tn > 0) {
+      const batch = new Batch();
+      const cone = new THREE.ConeGeometry(0.28, 1, 7, 1);
+      cone.translate(0, 0.5, 0);
+      const tr = rng(seed + 77);
+      const rows = m.teeth === 'shark' ? 2 : 1; // functional outer row + inner replacement row in sharks
+      for (let row = 0; row < rows; row++)
+        for (const side of [1, -1] as const)
+          for (const upper of [true, false]) {
+            const n = m.tn;
+            for (let i = 0; i < n; i++) {
+              const t = (i + 0.45) / (n + 0.35) * 0.86;
+              const R0 = rimPoint(t, side, !upper);
+              const ctr = model.local(R0.s, model.mouthY(Math.min(R0.s, rc.s)), 0);
+              const snaggle = sp.id === 'shortfin-mako' || sp.id === 'sloane-s-viperfish' || sp.id === 'black-dragonfish' || sp.id === 'humpback-anglerfish';
+              const inset = (snaggle ? 0.05 : 0.14) + row * 0.085;
+              const lp = R0.p.clone().lerp(ctr, inset);
+              const f = model.frame(R0.s);
+              const dir = f.N.clone()
+                .multiplyScalar(upper ? -1 : 1)
+                .addScaledVector(f.T, 0.26 + row * 0.2)
+                .add(new THREE.Vector3(0, 0, -side * (0.18 + 0.1 * t)))
+                .normalize();
+              let h = m.ts * L * (row === 0 ? 1 : 0.72);
+              let rad = 1, flat = 1;
+              switch (m.teeth) {
+                case 'fang': h *= (i % 3 === 0 ? 1.55 : 0.62) * (1.22 - t * 0.55) * (0.88 + tr() * 0.24); rad = 0.52; break;
+                case 'tri': rad = 1.55; flat = 0.32; h *= 1.05 - 0.3 * t; break;
+                case 'shark': rad = 1.55; flat = 0.28; h *= (upper ? 1.08 : 0.86) * (1.08 - 0.42 * t); break;
+                case 'needle': rad = 0.44; h *= 0.82 + tr() * 0.36; break;
+                case 'fine': h *= 0.58; break;
+              }
+              if (m.teeth === 'shark' || m.teeth === 'tri') dir.addScaledVector(f.T, -0.15).normalize();
+              const M = orient(lp, dir, h * rad, h, h * rad * flat);
+              batch.add(cone, M, R0.jw, undefined, 0, R0.pl);
+            }
+          }
+      const toothMat = patchMaterial(new THREE.MeshPhysicalMaterial({ color: '#f5f0e4', roughness: 0.22, clearcoat: 0.65 }), u);
+      addMesh(batch.build(), toothMat, 2);
+    }
+  }
+
